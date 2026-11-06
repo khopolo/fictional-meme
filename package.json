@@ -1,0 +1,41 @@
+{
+  "name": "docuflow-ai",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node server/index.js",
+    "build": "vite build",
+    "test": "bash scripts/test.sh",
+    "test:rls": "bash scripts/test-postgres.sh"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.80.0",
+    "archiver": "^7.0.1",
+    "cors": "^2.8.5",
+    "diff": "^8.0.2",
+    "docx": "^9.5.1",
+    "express": "^5.1.0",
+    "helmet": "^8.1.0",
+    "lucide-react": "^0.468.0",
+    "mammoth": "^1.10.0",
+    "multer": "^2.0.2",
+    "pdf-lib": "^1.17.1",
+    "pdf-parse": "^2.4.5",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "tesseract.js": "^6.0.1",
+    "vite": "^7.2.0",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+  },
+  "overrides": {
+    "archiver-utils": {
+      "glob": "^14.0.2"
+    },
+    "minimatch": "^11.0.1"
+  },
+  "devDependencies": {
+    "@napi-rs/canvas": "^0.1.80",
+    "prettier": "^3.9.10"
+  }
+}
