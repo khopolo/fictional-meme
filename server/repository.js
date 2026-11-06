@@ -16,17 +16,82 @@ export const tables = {
   generated: "generated_documents",
   business: "business_profiles",
   tenders: "tender_projects",
+  plans: "subscription_plans",
+  subscriptions: "user_subscriptions",
+  user_subscriptions: "user_subscriptions",
   comparisons: "document_comparisons",
   audit: "audit_logs",
   authorisations: "signing_authorisations",
 };
 function row(data) {
+  const now = new Date().toISOString();
   return {
     ...data,
     id: data.id || crypto.randomUUID(),
-    createdAt: data.createdAt || new Date().toISOString(),
+    createdAt: data.createdAt || now,
+    updatedAt: data.updatedAt || data.createdAt || now,
   };
 }
+export async function getActiveSubscription(repo) {
+  const subs = await repo.list("user_subscriptions");
+  const plans = repo.listPlans
+    ? await repo.listPlans()
+    : await repo.list("subscription_plans");
+  const planById = new Map(plans.map((plan) => [plan.id, plan]));
+  let active = null;
+  for (const sub of subs) {
+    const owner = sub.ownerId ?? sub.owner_id ?? repo.owner;
+    if (owner !== repo.owner) continue;
+    const status = String(sub.status || "").toLowerCase();
+    const expiresAt = sub.expiresAt ?? sub.expires_at ?? null;
+    if (!["active", "trial"].includes(status)) continue;
+    if (expiresAt && new Date(expiresAt).getTime() <= Date.now()) continue;
+    const candidate = {
+      ...sub,
+      plan: planById.get(sub.planId ?? sub.plan_id ?? sub.planID) || null,
+    };
+    if (!active) {
+      active = candidate;
+      continue;
+    }
+    const aTs = new Date(active.updatedAt || active.createdAt || 0).getTime();
+    const cTs = new Date(sub.updatedAt || sub.createdAt || 0).getTime();
+    if (cTs > aTs) active = candidate;
+  }
+  return active;
+}
+export async function hasEntitlement(repo, entitlement) {
+  if (!entitlement) return false;
+  const subscription = await getActiveSubscription(repo);
+  if (!subscription) return false;
+  const plan = subscription.plan;
+  if (!plan || plan.active === false) return false;
+  const entitlements = plan.entitlements || {};
+  return Boolean(entitlements[entitlement]);
+}
+export async function recoverProcessingJobs(repo, { staleAfterMs = 5 * 60 * 1000 } = {}) {
+  const jobs = await repo.list("jobs");
+  for (const job of jobs) {
+    if (job.status !== "Processing") continue;
+    const touchedAt = new Date(job.updatedAt || job.createdAt || 0).getTime();
+    if (Number.isNaN(touchedAt) || Date.now() - touchedAt < staleAfterMs) continue;
+    const next = {
+      ...job,
+      status: "Interrupted",
+      errors: [
+        ...(Array.isArray(job.errors) ? job.errors : []),
+        {
+          record: 0,
+          error:
+            "Processing stalled or the server restarted. Review completed files before starting another batch.",
+        },
+      ],
+      updatedAt: new Date().toISOString(),
+    };
+    await repo.save("jobs", next);
+  }
+}
+
 export function createLocalDatabase(root) {
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const db = new DatabaseSync(path.join(root, "workspace.db"));
@@ -39,11 +104,15 @@ export function createLocalDatabase(root) {
     const job = JSON.parse(r.data);
     if (job.status === "Processing") {
       job.status = "Interrupted";
-      job.errors.push({
-        record: 0,
-        error:
-          "Server restarted. Review completed files before starting another batch.",
-      });
+      job.updatedAt = new Date().toISOString();
+      job.errors = [
+        ...(Array.isArray(job.errors) ? job.errors : []),
+        {
+          record: 0,
+          error:
+            "Processing stalled or the server restarted. Review completed files before starting another batch.",
+        },
+      ];
       db.prepare("UPDATE entities SET data=? WHERE owner=? AND id=?").run(
         JSON.stringify(job),
         r.owner,
@@ -151,6 +220,25 @@ export function remoteColumns(kind, d) {
         status: d.status,
         progress: { completed: d.completed, failed: d.failed, total: d.total },
       };
+    case "plans":
+    case "subscription_plans":
+      return {
+        ...common,
+        name: d.name,
+        entitlements: d.entitlements || {},
+        provider_price_id: d.providerPriceId || d.provider_price_id || null,
+        active: d.active !== false,
+      };
+    case "subscriptions":
+    case "user_subscriptions":
+      return {
+        ...common,
+        owner_id: d.ownerId || d.owner_id || d.owner || null,
+        plan_id: d.planId || d.plan_id || null,
+        provider_reference: d.providerReference || d.provider_reference || null,
+        status: d.status,
+        expires_at: d.expiresAt || d.expires_at || null,
+      };
     case "generated":
       return {
         ...common,
@@ -201,6 +289,14 @@ export class SupabaseRepository {
       if (data.length < 500) break;
     }
     return out;
+  }
+  async listPlans() {
+    const { data, error } = await this.admin
+      .from("subscription_plans")
+      .select("id,name,entitlements,active")
+      .eq("active", true);
+    if (error) throw new Error("Database plan read failed: " + error.message);
+    return data;
   }
   async get(id, kind) {
     for (const k of kind ? [kind] : Object.keys(tables)) {

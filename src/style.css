@@ -101,6 +101,42 @@ svg {
   display: flex;
   min-height: 100vh;
 }
+.checkout-result {
+  min-height: 100vh;
+  display: grid;
+  align-content: center;
+  justify-items: start;
+  gap: 18px;
+  max-width: 620px;
+  margin: 0 auto;
+  padding: 48px 28px;
+}
+.checkout-mark {
+  width: 58px;
+  aspect-ratio: 1;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+}
+.checkout-mark.success {
+  color: #176f56;
+  background: #dff4e9;
+}
+.checkout-mark.cancelled {
+  color: #a64e42;
+  background: #f9e6e1;
+}
+.checkout-result h1 {
+  max-width: 560px;
+  line-height: 1.2;
+}
+.checkout-result p {
+  max-width: 540px;
+  font-size: 15px;
+}
+.checkout-result .primary {
+  margin-top: 6px;
+}
 .sidebar {
   width: 242px;
   background: #11162b;

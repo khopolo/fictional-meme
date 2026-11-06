@@ -11,10 +11,13 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
+import { createPayfastSignature, verifyPayfastNotification } from "./payfast.js";
 import {
   createLocalDatabase,
   LocalRepository,
   SupabaseRepository,
+  hasEntitlement,
+  recoverProcessingJobs,
 } from "./repository.js";
 import { createClient } from "@supabase/supabase-js";
 import archiver from "archiver";
@@ -31,6 +34,35 @@ const enqueueProcessing = createProcessingQueue(2);
 const extractionLocks = new Set();
 const root = path.resolve(process.env.DATA_DIR || ".data");
 fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+function validateDeploymentConfig() {
+  const checks = [
+    ["SUPABASE_URL", process.env.SUPABASE_URL, true],
+    ["AI_BASE_URL", process.env.AI_BASE_URL, true],
+    ["AI_MODEL", process.env.AI_MODEL, true],
+  ];
+  for (const [name, value, optional] of checks) {
+    if (!value) {
+      if (optional) continue;
+      throw new Error(`Missing ${name}`);
+    }
+    if (name === "SUPABASE_URL" || name === "AI_BASE_URL") {
+      try {
+        const url = new URL(value);
+        if (!["http:", "https:"].includes(url.protocol)) throw new Error();
+      } catch {
+        throw new Error(`Invalid ${name}`);
+      }
+    }
+    if (name === "AI_MODEL" && !String(value).trim())
+      throw new Error("Invalid AI_MODEL");
+  }
+  if (
+    (process.env.SUPABASE_URL && !process.env.SUPABASE_ANON_KEY) ||
+    (!process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY)
+  )
+    throw new Error("Supabase auth requires both SUPABASE_URL and SUPABASE_ANON_KEY");
+}
+validateDeploymentConfig();
 const configured = !!(
   process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY
 );
@@ -63,15 +95,154 @@ if (admin) {
       );
   }
 }
+const startedAt = Date.now();
+const requestBuckets = new Map();
+const API_RATE_LIMIT_WINDOW_MS = 60_000;
+const API_RATE_LIMIT_MAX = 300;
+const subscriptionPlans = [
+  {
+    slug: "starter",
+    name: "Starter",
+    price: 399,
+    currency: "ZAR",
+    trialDays: 0,
+    entitlements: {
+      generation: true,
+      ai: false,
+      team: false,
+      business: false,
+      tender: false,
+      signing: true,
+    },
+  },
+  {
+    slug: "pro",
+    name: "Pro",
+    price: 899,
+    currency: "ZAR",
+    trialDays: 14,
+    entitlements: {
+      generation: true,
+      ai: true,
+      team: false,
+      business: true,
+      tender: true,
+      signing: true,
+    },
+  },
+  {
+    slug: "business",
+    name: "Business",
+    price: 1999,
+    currency: "ZAR",
+    trialDays: 14,
+    entitlements: {
+      generation: true,
+      ai: true,
+      team: true,
+      business: true,
+      tender: true,
+      signing: true,
+    },
+  },
+];
+const apiRateLimiter = (req, res, next) => {
+  if (req.path === "/health") return next();
+  const forwarded = req.headers["x-forwarded-for"];
+  const ip = forwarded
+    ? String(forwarded).split(",")[0].trim()
+    : req.socket.remoteAddress || "unknown";
+  const now = Date.now();
+  const bucket = requestBuckets.get(ip) || {
+    count: 0,
+    resetAt: now + API_RATE_LIMIT_WINDOW_MS,
+  };
+  if (now >= bucket.resetAt) {
+    bucket.count = 0;
+    bucket.resetAt = now + API_RATE_LIMIT_WINDOW_MS;
+  }
+  if (bucket.count >= API_RATE_LIMIT_MAX) {
+    return res.status(429).json({
+      error: "Too many requests. Please retry later.",
+    });
+  }
+  bucket.count += 1;
+  requestBuckets.set(ip, bucket);
+  next();
+};
+function logEvent(level, event, meta = {}) {
+  const entry = {
+    ts: new Date().toISOString(),
+    level,
+    event,
+    ...meta,
+  };
+  if (level === "error") console.error(JSON.stringify(entry));
+  else console.log(JSON.stringify(entry));
+}
+
 const app = express();
+app.disable("x-powered-by");
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "5mb", strict: true }));
+app.use(express.urlencoded({ extended: false }));
+app.use((req, res, next) => {
+  req.requestId = req.headers["x-request-id"] || crypto.randomUUID();
+  res.setHeader("x-request-id", req.requestId);
+  const started = Date.now();
+  res.on("finish", () => {
+    logEvent("info", "http_request", {
+      requestId: req.requestId,
+      method: req.method,
+      path: req.originalUrl,
+      status: res.statusCode,
+      durationMs: Date.now() - started,
+      ip: req.ip,
+    });
+  });
+  next();
+});
 const supabase =
   process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY
     ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY)
     : null;
 if (process.env.NODE_ENV === "production" && !supabase)
   throw new Error("Production requires Supabase authentication configuration");
+app.use("/api", apiRateLimiter);
+app.use("/api", (req, res, next) => {
+  if (req.path === "/payfast/notify") return next();
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
+  const origin = req.headers.origin || req.headers.referer;
+  if (!origin) {
+    const host = (req.headers.host || "").split(":")[0];
+    const hostname = req.hostname || host;
+    if (process.env.NODE_ENV !== "production") {
+      if (["localhost", "127.0.0.1", "::1"].includes(hostname)) return next();
+    }
+    return res.status(403).json({
+      error: "Forbidden: missing Origin header for state-changing request",
+    });
+  }
+  try {
+    const requestOrigin = new URL(origin);
+    const host = req.headers.host || "";
+    const requestHost = host.split(":")[0];
+    const originHost = requestOrigin.hostname;
+    if (
+      originHost !== requestHost &&
+      !["localhost", "127.0.0.1", "::1"].includes(originHost)
+    ) {
+      return res.status(403).json({
+        error: "Forbidden: invalid Origin for CSRF-protected request",
+      });
+    }
+  } catch {
+    return res.status(403).json({
+      error: "Forbidden: invalid Origin for CSRF-protected request",
+    });
+  }
+  next();
+});
 app.get("/api/config", async (q, s) =>
   s.json({
     local: !supabase,
@@ -82,10 +253,230 @@ app.get("/api/config", async (q, s) =>
     maxUploadMB: 25,
   }),
 );
+app.get(["/health", "/api/health"], (q, s) => {
+  const warnings = [];
+  if (!process.env.AI_API_KEY) warnings.push("AI provider not configured");
+  if (!configured) warnings.push("Hosted Supabase not configured");
+  if (configured && !process.env.SUPABASE_SERVICE_ROLE_KEY)
+    warnings.push("Supabase service role key missing");
+  if (configured && !process.env.AI_API_KEY)
+    warnings.push("Hosted AI workload not ready");
+  if (configured || process.env.NODE_ENV === "production")
+    warnings.push("Production billing and legal checks still require external verification");
+  s.json({
+    status: "ok",
+    uptime: Math.max(0, (Date.now() - startedAt) / 1000),
+    persistence: configured ? "supabase" : "local",
+    readiness: warnings.length ? "degraded" : "ready",
+    warnings,
+    timestamp: new Date().toISOString(),
+    mode: process.env.NODE_ENV || "development",
+  });
+});
+app.get("/api/plans", (q, s) =>
+  s.json({
+    trialDays: 14,
+    plans: subscriptionPlans.map(({ entitlements, ...plan }) => ({
+      ...plan,
+      amount: plan.price,
+      entitlements,
+    })),
+  }),
+);
+app.post("/api/payfast/notify", async (q, s) => {
+  const body = q.body || {};
+  if (
+    !process.env.PAYFAST_MERCHANT_ID ||
+    !process.env.PAYFAST_PASSPHRASE ||
+    !["sandbox", "live"].includes(process.env.PAYFAST_MODE || "sandbox")
+  )
+    return s.status(503).send("PayFast verification is not configured");
+  let verified;
+  try {
+    verified = await verifyPayfastNotification(body, {
+      mode: process.env.PAYFAST_MODE || "sandbox",
+      merchantId: process.env.PAYFAST_MERCHANT_ID,
+      passphrase: process.env.PAYFAST_PASSPHRASE,
+    });
+  } catch (error) {
+    logEvent("error", "payfast_verification_failed", { error: error.message });
+    return s.status(503).send("PayFast verification unavailable");
+  }
+  if (!verified) return s.status(400).send("Invalid PayFast notification");
+  if (body.payment_status !== "COMPLETE") return s.status(200).send("OK");
+  const paymentId = String(body.m_payment_id || "");
+  if (!paymentId) return s.status(400).send("Missing payment reference");
+
+  let pending;
+  if (configured) {
+    const { data, error } = await admin
+      .from("user_subscriptions")
+      .select("id,owner_id,payload")
+      .eq("provider_reference", paymentId)
+      .maybeSingle();
+    if (error) throw new Error("Could not find pending PayFast order");
+    if (data)
+      pending = { ...data.payload, id: data.id, ownerId: data.owner_id };
+  } else {
+    pending = db
+      .prepare("SELECT owner,data FROM entities WHERE kind=?")
+      .all("user_subscriptions")
+      .map((entry) => ({ ...JSON.parse(entry.data), ownerId: entry.owner }))
+      .find((entry) => entry.providerReference === paymentId);
+  }
+  if (!pending) return s.status(404).send("Unknown PayFast order");
+  const plan = subscriptionPlans.find((entry) => entry.slug === pending.planSlug);
+  if (!plan) return s.status(400).send("Unknown plan for PayFast order");
+  const gross = Number(body.amount_gross);
+  if (!Number.isFinite(gross) || gross.toFixed(2) !== Number(plan.price).toFixed(2))
+    return s.status(400).send("PayFast amount does not match the order");
+  const providerPaymentId = String(body.pf_payment_id || paymentId);
+  const processedPayments = Array.isArray(pending.processedPaymentIds)
+    ? pending.processedPaymentIds
+    : [];
+  if (processedPayments.includes(providerPaymentId))
+    return s.status(200).send("OK");
+  const previousExpiry = new Date(pending.expiresAt || 0).getTime();
+  const renewalBase = Math.max(Date.now(), Number.isFinite(previousExpiry) ? previousExpiry : 0);
+  const repo = configured
+    ? new SupabaseRepository(admin, admin, pending.ownerId)
+    : new LocalRepository(db, root, pending.ownerId);
+  await repo.save("user_subscriptions", {
+    ...pending,
+    status: "active",
+    expiresAt: new Date(renewalBase + 30 * 24 * 60 * 60 * 1000).toISOString(),
+    processedPaymentIds: [...processedPayments, providerPaymentId].slice(-50),
+    paymentId: providerPaymentId,
+  });
+  logEvent("info", "payfast_subscription_activated", {
+    ownerId: pending.ownerId,
+    plan: plan.slug,
+    paymentId,
+  });
+  return s.status(200).send("OK");
+});
+app.post("/api/checkout", async (q, s) => {
+  const { plan: slug, email } = q.body || {};
+  const plan = subscriptionPlans.find((entry) => entry.slug === slug);
+  if (!plan) return s.status(400).json({ error: "Unknown plan" });
+  const hasPayfast =
+    process.env.PAYFAST_MERCHANT_ID &&
+    process.env.PAYFAST_MERCHANT_KEY &&
+    process.env.PAYFAST_PASSPHRASE;
+  if (!hasPayfast)
+    return s.status(503).json({
+      error:
+        "PayFast is not configured. Add PAYFAST_MERCHANT_ID, PAYFAST_MERCHANT_KEY and PAYFAST_PASSPHRASE.",
+    });
+  if (!["sandbox", "live"].includes(process.env.PAYFAST_MODE || "sandbox"))
+    return s.status(503).json({ error: "PAYFAST_MODE must be sandbox or live" });
+  let ownerId = "local-workspace";
+  if (supabase) {
+    const token = q.headers.authorization?.replace(/^Bearer /, "");
+    if (!token) return s.status(401).json({ error: "Sign in required" });
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data.user)
+      return s.status(401).json({ error: "Invalid session" });
+    ownerId = data.user.id;
+  }
+  const defaultBase = process.env.NODE_ENV === "production" ? "" : "http://localhost:3000";
+  const returnUrl = process.env.PAYFAST_RETURN_URL || `${defaultBase}/checkout/success`;
+  const cancelUrl = process.env.PAYFAST_CANCEL_URL || `${defaultBase}/checkout/cancel`;
+  const notifyUrl = process.env.PAYFAST_NOTIFY_URL || `${defaultBase}/api/payfast/notify`;
+  if (!returnUrl || !cancelUrl || !notifyUrl)
+    return s.status(503).json({
+      error: "Set public HTTPS return, cancel, and notify URLs for PayFast.",
+    });
+  try {
+    const urls = [returnUrl, cancelUrl, notifyUrl].map((value) => new URL(value));
+    if (
+      process.env.NODE_ENV === "production" &&
+      urls.some((url) => url.protocol !== "https:")
+    )
+      return s.status(503).json({ error: "PayFast production URLs must use HTTPS" });
+  } catch {
+    return s.status(503).json({ error: "PayFast URLs must be valid absolute URLs" });
+  }
+  const repo = configured
+    ? new SupabaseRepository(admin, admin, ownerId)
+    : new LocalRepository(db, root, ownerId);
+  let planRecord;
+  if (configured) {
+    const { data, error } = await admin
+      .from("subscription_plans")
+      .upsert(
+        { name: plan.name, entitlements: plan.entitlements, active: true },
+        { onConflict: "name" },
+      )
+      .select("id,name,entitlements,active")
+      .single();
+    if (error) throw new Error("Could not prepare subscription plan");
+    planRecord = data;
+  } else {
+    planRecord = (await repo.list("subscription_plans")).find(
+      (entry) => entry.slug === plan.slug,
+    );
+    if (!planRecord)
+      planRecord = await repo.save("subscription_plans", {
+        id: crypto.randomUUID(),
+        name: plan.name,
+        slug: plan.slug,
+        entitlements: plan.entitlements,
+        active: true,
+      });
+  }
+  const paymentId = crypto.randomUUID();
+  await repo.save("user_subscriptions", {
+    id: crypto.randomUUID(),
+    ownerId,
+    planId: planRecord.id,
+    planSlug: plan.slug,
+    providerReference: paymentId,
+    status: "pending",
+    expiresAt: null,
+  });
+  const payfastUrl =
+    process.env.PAYFAST_MODE === "live"
+      ? "https://www.payfast.co.za/eng/process"
+      : "https://sandbox.payfast.co.za/eng/process";
+  const amount = Number(plan.price).toFixed(2);
+  const payload = {
+    merchant_id: process.env.PAYFAST_MERCHANT_ID,
+    merchant_key: process.env.PAYFAST_MERCHANT_KEY,
+    return_url: returnUrl,
+    cancel_url: cancelUrl,
+    notify_url: notifyUrl,
+    m_payment_id: paymentId,
+    amount,
+    item_name: `${plan.name} subscription`,
+    item_description: `${plan.name} monthly subscription`,
+    email_address: email || "",
+    currency: plan.currency,
+    subscription_type: "1",
+    frequency: "3",
+    cycles: "0",
+  };
+  payload.signature = createPayfastSignature(
+    payload,
+    process.env.PAYFAST_PASSPHRASE,
+  );
+  const query = new URLSearchParams(payload).toString();
+  s.json({
+    ok: true,
+    checkout: {
+      url: `${payfastUrl}?${query}`,
+      plan: plan.slug,
+      amount: Number(amount),
+      currency: plan.currency,
+      trialDays: plan.trialDays,
+    },
+  });
+});
 app.use("/api", async (q, s, next) => {
   if (!supabase) {
     q.owner = "local-workspace";
     q.repo = new LocalRepository(db, root, q.owner);
+    await recoverActiveJobs(q.repo);
     return next();
   }
   const token = q.headers.authorization?.replace(/^Bearer /, "");
@@ -103,6 +494,7 @@ app.use("/api", async (q, s, next) => {
     },
   );
   q.repo = new SupabaseRepository(client, admin, q.owner);
+  await recoverActiveJobs(q.repo);
   next();
 });
 const list = (repo, kind) => repo.list(kind);
@@ -110,6 +502,17 @@ const get = (repo, id, kind) => repo.get(id, kind);
 const save = (repo, kind, data) => repo.save(kind, data);
 const audit = (repo, action, details) =>
   save(repo, "audit", { action, details });
+async function requireEntitlement(repo, entitlement, action) {
+  const hosted = Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY);
+  if (!hosted) return true;
+  const hasAccess = await hasEntitlement(repo, entitlement);
+  if (!hasAccess)
+    throw new Error(`${action} requires an active subscription with the ${entitlement} entitlement.`);
+  return true;
+}
+async function recoverActiveJobs(repo) {
+  await recoverProcessingJobs(repo, { staleAfterMs: 5 * 60 * 1000 });
+}
 async function signatureBytes(repo, signature) {
   return signature.image
     ? Buffer.from(signature.image.split(",")[1], "base64")
@@ -418,6 +821,8 @@ app.post("/api/documents/:id/extract", async (q, s) => {
     return s
       .status(409)
       .json({ error: "Extraction is already running for this document" });
+  if (q.body.mode === "ai")
+    await requireEntitlement(q.repo, "ai", "AI extraction");
   extractionLocks.add(key);
   try {
     const doc = await get(q.repo, q.params.id, "documents");
@@ -567,7 +972,58 @@ app.post("/api/preview", async (q, s) => {
   );
   s.type("pdf").send(Buffer.from(bytes));
 });
+async function runGenerationBatch({ repo, job, template, dataset, mappings, sourceBytes, signingBytes, owner }) {
+  const existing = (await list(repo, "generated")).filter((d) => d.jobId === job.id);
+  for (const item of existing) {
+    await repo.deleteFile(item).catch(() => {});
+    await repo.remove(item.id, "generated");
+  }
+  job.completed = 0;
+  job.failed = 0;
+  job.errors = [];
+  job.status = "Processing";
+  job.updatedAt = new Date().toISOString();
+  await save(repo, "jobs", job);
+  for (let i = 0; i < dataset.records.length; i++) {
+    let file;
+    try {
+      const bytes = await generatePDF(
+        template,
+        sourceBytes,
+        dataset.records[i],
+        mappings,
+        signingBytes,
+      );
+      const id = crypto.randomUUID();
+      file = await repo.putFile(bytes);
+      await save(repo, "generated", {
+        id,
+        jobId: job.id,
+        name: `${template.name.replace(/[^a-z0-9 -]/gi, "")}-${i + 1}.pdf`,
+        size: bytes.length,
+        ...file,
+        record: i + 1,
+      });
+      job.completed++;
+    } catch (e) {
+      if (file)
+        await repo
+          .deleteFile(file)
+          .catch(() => console.error("Generated file cleanup requires retry"));
+      job.failed++;
+      job.errors.push({ record: i + 1, error: e.message });
+    }
+    job.updatedAt = new Date().toISOString();
+    await save(repo, "jobs", job);
+  }
+  job.status = job.failed ? "Completed with errors" : "Completed";
+  job.updatedAt = new Date().toISOString();
+  await save(repo, "jobs", job);
+  await audit(repo, "Generation completed", job.name);
+  return job;
+}
 app.post("/api/generate", async (q, s) => {
+  await requireEntitlement(q.repo, "generation", "Document generation");
   const { templateId, datasetId, mappings, signatureId, authorised } = q.body;
   const template = await get(q.repo, templateId, "templates"),
     dataset = await get(q.repo, datasetId, "datasets");
@@ -599,6 +1055,8 @@ app.post("/api/generate", async (q, s) => {
     completed: 0,
     failed: 0,
     errors: [],
+    mappings,
+    updatedAt: new Date().toISOString(),
   });
   if (signature) {
     await save(q.repo, "authorisations", {
@@ -614,48 +1072,49 @@ app.post("/api/generate", async (q, s) => {
     });
   }
   s.json(job);
-  const batch = async () => {
-    for (let i = 0; i < dataset.records.length; i++) {
-      let file;
-      try {
-        const bytes = await generatePDF(
-          template,
-          sourceBytes,
-          dataset.records[i],
-          mappings,
-          signingBytes,
-        );
-        const id = crypto.randomUUID();
-        file = await q.repo.putFile(bytes);
-        await save(q.repo, "generated", {
-          id,
-          jobId: job.id,
-          name: `${template.name.replace(/[^a-z0-9 -]/gi, "")}-${i + 1}.pdf`,
-          size: bytes.length,
-          ...file,
-          record: i + 1,
-        });
-        job.completed++;
-      } catch (e) {
-        if (file)
-          await q.repo
-            .deleteFile(file)
-            .catch(() =>
-              console.error("Generated file cleanup requires retry"),
-            );
-        job.failed++;
-        job.errors.push({ record: i + 1, error: e.message });
-      }
-      await save(q.repo, "jobs", job);
-    }
-    job.status = job.failed ? "Completed with errors" : "Completed";
-    await save(q.repo, "jobs", job);
-    await audit(q.repo, "Generation completed", job.name);
-  };
   setImmediate(() =>
-    batch().catch(() =>
+    runGenerationBatch({
+      repo: q.repo,
+      job,
+      template,
+      dataset,
+      mappings,
+      sourceBytes,
+      signingBytes,
+      owner: q.owner,
+    }).catch(() =>
       console.error("Generation worker could not persist its result"),
     ),
+  );
+});
+app.post("/api/jobs/:id/retry", async (q, s) => {
+  const job = await get(q.repo, q.params.id, "jobs");
+  if (job.status === "Processing")
+    return s.status(409).json({ error: "Generation is already running" });
+  const template = await get(q.repo, job.templateId, "templates");
+  const dataset = await get(q.repo, job.datasetId, "datasets");
+  const signature = job.signatureId
+    ? await get(q.repo, job.signatureId, "signatures")
+    : null;
+  const source = template.documentId
+    ? await get(q.repo, template.documentId, "documents")
+    : null;
+  const sourceBytes = source ? await q.repo.readFile(source) : null;
+  const signingBytes = signature
+    ? await signatureBytes(q.repo, signature)
+    : null;
+  const mappings = job.mappings || {};
+  s.json(
+    await runGenerationBatch({
+      repo: q.repo,
+      job,
+      template,
+      dataset,
+      mappings,
+      sourceBytes,
+      signingBytes,
+      owner: q.owner,
+    }),
   );
 });
 app.get("/api/jobs/:id/zip", async (q, s) => {
@@ -729,9 +1188,19 @@ app.post("/api/assistant", async (q, s) => {
   const result = await r.json();
   s.json({ message: result.choices[0].message.content });
 });
-app.use("/api", (e, q, s, n) =>
-  s.status(e.status || 400).json({ error: e.message }),
-);
+app.use("/api", (e, q, s, n) => {
+  const status = e.status || e.statusCode || 400;
+  const message = e.message || "Bad request";
+  logEvent("error", "api_error", {
+    requestId: q.requestId,
+    method: q.method,
+    path: q.originalUrl,
+    status,
+    message,
+    stack: process.env.NODE_ENV === "production" ? undefined : e.stack,
+  });
+  s.status(status).json({ error: message, requestId: q.requestId });
+});
 if (process.env.NODE_ENV === "production") {
   app.use(express.static("dist"));
   app.get("/{*path}", async (q, s) =>
@@ -746,6 +1215,35 @@ if (process.env.NODE_ENV === "production") {
   app.use(vite.middlewares);
 }
 const port = Number(process.env.PORT) || 3000;
-app.listen(port, "0.0.0.0", () =>
-  console.log("DocuFlow ready on port " + port),
+let shuttingDown = false;
+const shutdown = (signal) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logEvent("info", "shutdown_started", { signal, port });
+  server.close(() => {
+    logEvent("info", "shutdown_complete", { signal, port });
+    process.exit(0);
+  });
+  setTimeout(() => {
+    logEvent("error", "shutdown_timeout", { signal, port });
+    process.exit(1);
+  }, 10000).unref();
+};
+const server = app.listen(port, "0.0.0.0", () =>
+  logEvent("info", "server_started", { port, env: process.env.NODE_ENV || "development" }),
 );
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("uncaughtException", (error) => {
+  logEvent("error", "uncaught_exception", {
+    message: error.message,
+    stack: error.stack,
+  });
+  process.exitCode = 1;
+});
+process.on("unhandledRejection", (reason) => {
+  logEvent("error", "unhandled_rejection", {
+    message: reason instanceof Error ? reason.message : String(reason),
+    stack: reason instanceof Error ? reason.stack : undefined,
+  });
+});

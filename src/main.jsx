@@ -284,6 +284,26 @@ function App() {
         <Layers /> Loading your workspace…
       </div>
     );
+  if (["/checkout/success", "/checkout/cancel"].includes(window.location.pathname)) {
+    const success = window.location.pathname === "/checkout/success";
+    return (
+      <main className="checkout-result">
+        <div className={success ? "checkout-mark success" : "checkout-mark cancelled"}>
+          {success ? <Clock size={27} /> : <X size={27} />}
+        </div>
+        <div className="eyebrow">DOCUFLOW AI BILLING</div>
+        <h1>{success ? "Payment confirmation is pending" : "Checkout was cancelled"}</h1>
+        <p>
+          {success
+            ? "PayFast is confirming your payment. Your subscription will activate after we verify its secure notification. This return page alone does not confirm payment."
+            : "No subscription has been activated. If you completed payment in another window, allow time for PayFast to notify us before trying again."}
+        </p>
+        <button className="primary" onClick={() => window.location.assign("/")}>
+          Return to DocuFlow
+        </button>
+      </main>
+    );
+  }
   if (recovering && auth)
     return (
       <PasswordRecovery auth={auth} complete={() => setRecovering(false)} />
@@ -1183,6 +1203,11 @@ function App() {
                         title: "Privacy & terms",
                         content: (
                           <>
+                            <h3>Application owner</h3>
+                            <p>
+                              This application was created by Zephyr Consulting
+                              Pty Ltd, 2026 / 772679 / 07.
+                            </p>
                             <h3>Your data</h3>
                             <p>
                               Document content is stored in this workspace. AI

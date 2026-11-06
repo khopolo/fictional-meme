@@ -1,5 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import path from "node:path";
 import XLSX from "xlsx";
 import { PDFDocument, StandardFonts } from "pdf-lib";
 import { Document, Packer, Paragraph } from "docx";
@@ -15,6 +17,72 @@ async function req(p, body, method = "POST") {
 async function state() {
   return (await fetch(base + "/state")).json();
 }
+test("subscription plans expose pricing and a 14-day trial", async () => {
+  const plans = await fetch(base + "/plans");
+  assert.equal(plans.status, 200);
+  const payload = await plans.json();
+  assert.ok(Array.isArray(payload.plans));
+  assert.ok(payload.plans.some((plan) => plan.slug === "starter"));
+  assert.ok(payload.plans.some((plan) => plan.slug === "pro"));
+  assert.equal(payload.trialDays, 14);
+});
+test("PayFast notify bypasses browser CSRF checks but refuses unconfigured verification", async () => {
+  const response = await fetch(base + "/payfast/notify", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: "payment_status=COMPLETE",
+  });
+  assert.equal(response.status, 503);
+  assert.match(await response.text(), /verification is not configured/i);
+});
+test("API health endpoint reports readiness for production monitoring", async () => {
+  const health = await fetch(base + "/health");
+  assert.equal(health.status, 200);
+  const payload = await health.json();
+  assert.equal(payload.status, "ok");
+  assert.ok(payload.uptime >= 0);
+  assert.equal(payload.persistence, "local");
+  assert.ok(payload.readiness);
+  assert.ok(Array.isArray(payload.warnings));
+});
+test("API rate limiting blocks excessive requests", async () => {
+  const headers = { "X-Forwarded-For": "203.0.113.40" };
+  for (let i = 0; i < 300; i++) {
+    const res = await fetch(base + "/config", { headers });
+    assert.equal(res.status, 200);
+  }
+  const blocked = await fetch(base + "/config", { headers });
+  assert.equal(blocked.status, 429);
+  const payload = await blocked.json();
+  assert.match(payload.error, /Too many requests/i);
+});
+test("API rejects cross-origin mutation requests without a valid origin", async () => {
+  const res = await fetch(base + "/items/projects", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Origin: "https://evil.example",
+    },
+    body: JSON.stringify({ name: "Malicious request" }),
+  });
+  assert.equal(res.status, 403);
+  const payload = await res.json();
+  assert.match(payload.error, /origin|forbidden|csrf/i);
+});
+test("server rejects malformed production provider configuration", () => {
+  const cwd = path.resolve(import.meta.dirname, "..");
+  const res = spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      "process.env.NODE_ENV='production'; process.env.SUPABASE_URL='https://example.supabase.co'; process.env.SUPABASE_ANON_KEY='anon'; process.env.SUPABASE_SERVICE_ROLE_KEY='service'; process.env.AI_API_KEY='key'; process.env.AI_BASE_URL='not a url'; await import(new URL('./server/index.js', 'file://' + process.cwd() + '/'));",
+    ],
+    { cwd, encoding: "utf8" },
+  );
+  assert.notEqual(res.status, 0);
+  assert.match((res.stderr || res.stdout), /Invalid AI_BASE_URL/i);
+});
 test("HTTP workflow: real uploads, parsing, duplicate detection, generation, ZIP and deletion", async () => {
   const initial = await state();
   const before = new Set(
@@ -171,6 +239,15 @@ test("HTTP workflow: real uploads, parsing, duplicate detection, generation, ZIP
       current.generated.filter((g) => g.jobId === job.id).length,
       100,
     );
+    const retried = await req("/jobs/" + job.id + "/retry");
+    assert.equal(retried.status, 200);
+    for (let i = 0; i < 100; i++) {
+      current = await state();
+      if (current.jobs.find((j) => j.id === job.id)?.status === "Completed")
+        break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.equal(current.jobs.find((j) => j.id === job.id).status, "Completed");
     const zip = await fetch(base + "/jobs/" + job.id + "/zip");
     assert.equal(zip.status, 200);
     assert.equal(

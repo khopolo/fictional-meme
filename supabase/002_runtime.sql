@@ -1,5 +1,3 @@
--- Apply after schema.sql. Payloads preserve the complete editor configuration;
--- indexed typed columns and composite FKs continue to enforce ownership.
 begin;
 do $$ declare t text; begin
 foreach t in array array['uploaded_documents','projects','extracted_datasets','document_templates','signatures','generation_jobs','generated_documents','business_profiles','tender_projects','document_comparisons','audit_logs','signing_authorisations'] loop
@@ -11,7 +9,18 @@ foreach t in array array['uploaded_documents','projects','extracted_datasets','d
  execute format('grant select on public.%I to authenticated',t);
  execute format('grant all on public.%I to service_role',t);
 end loop; end $$;
--- Keep historical job/audit payloads when a user deletes a template, dataset or signature.
+do $$ declare t text; begin
+foreach t in array array['subscription_plans','user_subscriptions'] loop
+ execute format('alter table public.%I add column if not exists payload jsonb not null default ''{}''::jsonb',t);
+ execute format('alter table public.%I add column if not exists updated_at timestamptz not null default now()',t);
+ if t='user_subscriptions' then
+  revoke insert,update,delete on public.user_subscriptions from anon,authenticated;
+  grant select on public.user_subscriptions to authenticated;
+ else
+  execute format('revoke all on public.%I from anon, authenticated',t);
+ end if;
+ execute format('grant all on public.%I to service_role',t);
+end loop; end $$;
 alter table public.generation_jobs alter column template_id drop not null;
 alter table public.generation_jobs alter column dataset_id drop not null;
 alter table public.generation_jobs drop constraint generation_jobs_template_id_owner_id_fkey;
@@ -30,6 +39,5 @@ create function public.create_user_profile() returns trigger language plpgsql se
 create trigger new_user_profile after insert on auth.users for each row execute function public.create_user_profile();
 insert into public.profiles(id) select id from auth.users on conflict do nothing;
 grant select,update on public.profiles to authenticated;
--- No public files: storage writes and reads use owner-prefixed paths and RLS.
 update storage.buckets set public=false where id in ('documents','signatures');
 commit;

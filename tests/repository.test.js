@@ -8,6 +8,9 @@ import {
   createLocalDatabase,
   LocalRepository,
   SupabaseRepository,
+  getActiveSubscription,
+  hasEntitlement,
+  recoverProcessingJobs,
   remoteColumns,
 } from "../server/repository.js";
 test("local repository isolates records, mutations, types and files for two owners", async () => {
@@ -38,6 +41,69 @@ test("local repository isolates records, mutations, types and files for two owne
     await alice.deleteFile(own);
     await alice.remove(own.id);
     await assert.rejects(alice.get(own.id), { status: 404 });
+  } finally {
+    db.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+test("processing jobs recover from stale restart state", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "docuflow-job-recovery-"));
+  const db = createLocalDatabase(root);
+  try {
+    const repo = new LocalRepository(db, root, "alice");
+    const job = await repo.save("jobs", {
+      id: "job-123",
+      name: "Recovery test",
+      status: "Processing",
+      total: 2,
+      completed: 0,
+      failed: 0,
+      errors: [],
+      updatedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+    });
+    await recoverProcessingJobs(repo, { staleAfterMs: 60_000 });
+    const recovered = await repo.get(job.id, "jobs");
+    assert.equal(recovered.status, "Interrupted");
+    assert.ok(
+      recovered.errors.some((entry) => /stale|restart|timed out/i.test(entry.error)),
+    );
+  } finally {
+    db.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+test("subscription checks default to restricted access until an active plan exists", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "docuflow-subscription-"));
+  const db = createLocalDatabase(root);
+  try {
+    const repo = new LocalRepository(db, root, "alice");
+    assert.equal(await hasEntitlement(repo, "generation"), false);
+    assert.ok(!(await getActiveSubscription(repo)));
+  } finally {
+    db.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+test("active subscriptions grant the configured entitlements", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "docuflow-subscription-"));
+  const db = createLocalDatabase(root);
+  try {
+    const repo = new LocalRepository(db, root, "alice");
+    const plan = await repo.save("subscription_plans", {
+      id: "plan-1",
+      name: "pro",
+      active: true,
+      entitlements: { generation: true, ai: true },
+    });
+    await repo.save("user_subscriptions", {
+      id: "sub-1",
+      ownerId: "alice",
+      planId: plan.id,
+      status: "active",
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    assert.ok(await hasEntitlement(repo, "generation"));
+    assert.ok(await getActiveSubscription(repo));
   } finally {
     db.close();
     await fs.rm(root, { recursive: true, force: true });
@@ -94,6 +160,9 @@ test("Supabase SDK requests carry owner filters, JWTs, private paths and 60-seco
   const repo = new SupabaseRepository(client, admin, owner);
   assert.deepEqual(await repo.list("documents"), []);
   assert.equal(calls[0].u.searchParams.get("owner_id"), "eq." + owner);
+  assert.deepEqual(await repo.listPlans(), []);
+  const planRead = calls.find((c) => c.u.pathname.includes("subscription_plans"));
+  assert.equal(planRead.u.searchParams.has("owner_id"), false);
   assert.equal(
     new Headers(calls[0].options.headers).get("authorization"),
     "Bearer synthetic-user-jwt",
