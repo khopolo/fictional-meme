@@ -21,6 +21,24 @@ test("mapping combines names, preserves missing values and maps donations", () =
     mappedValue({ "First Name": "John", Surname: "Smith" }, m.FULL_NAME),
     "John Smith",
   );
+  assert.equal(
+    mappedValue({ Donation: 500 }, "Donation", "DONATION_AMOUNT")
+      .replace(/\u00a0/g, " "),
+    "R 500,00",
+  );
+  assert.equal(
+    mappedValue({ DueDate: "2026-03-01" }, "DueDate", "DUE_DATE")
+      .replace(/\u00a0/g, " "),
+    "01 Mar 2026",
+  );
+  assert.equal(
+    mappedValue({ Donation: 500 }, 'IF Donation > 0 THEN "Paid" ELSE "Pending"'),
+    "Paid",
+  );
+  assert.equal(
+    mappedValue({ Donation: 0 }, 'IF Donation > 0 THEN "Paid" ELSE "Pending"'),
+    "Pending",
+  );
   assert.equal(mappedValue({}, "Missing"), "");
 });
 test("100 PDFs contain the correct unique recipient and signature resource", async () => {
@@ -39,17 +57,27 @@ test("100 PDFs contain the correct unique recipient and signature resource", asy
       null,
       { name: "Donor " + i },
       { FULL_NAME: "name" },
-      signature,
+      {
+        bytes: signature,
+        name: "Jane Doe",
+        opacity: 0.85,
+        rotation: 15,
+        scale: 1.2,
+        width: 180,
+        height: 60,
+        printName: true,
+        printDate: true,
+      },
     );
     const doc = await PDFDocument.load(bytes);
     assert.equal(doc.getPageCount(), 1);
     assert.ok(doc.getPage(0).node.Resources().lookup(PDFName.of("XObject")));
     const parser = new PDFParse({ data: bytes });
     try {
-      assert.match(
-        (await parser.getText()).text,
-        new RegExp("Donor " + i + "\\b"),
-      );
+      const text = (await parser.getText()).text;
+      assert.match(text, new RegExp("Donor " + i + "\\b"));
+      assert.match(text, /Jane Doe/);
+      assert.match(text, /\d{2} [A-Za-z]{3} \d{4}/);
     } finally {
       await parser.destroy();
     }

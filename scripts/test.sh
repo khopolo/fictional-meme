@@ -16,4 +16,4 @@ for i in {1..100}; do
  sleep .1
 done
 if [ "$ready" != true ]; then cat "$DATA_DIR/server.log"; exit 1; fi
-TEST_API_URL="http://localhost:$PORT/api" node --test tests/*.test.js
+TEST_API_URL="http://localhost:$PORT/api" node --test --test-concurrency=1 tests/*.test.js

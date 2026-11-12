@@ -312,6 +312,55 @@ test("HTTP workflow: real uploads, parsing, duplicate detection, generation, ZIP
   }
 });
 
+test("generation accepts selected records and keeps filenames deterministic", async () => {
+  const before = new Set((await state()).documents.map((d) => d.id));
+  try {
+    const dataset = (
+      await req("/items/datasets", {
+        name: "Subset generation dataset",
+        records: [
+          { "Full Name": "Ada One", Donation: 100 },
+          { "Full Name": "Bob Two", Donation: 200 },
+          { "Full Name": "Cara Three", Donation: 300 },
+        ],
+      })
+    ).data;
+    const template = (
+      await req("/items/templates", {
+        name: "Subset & Test Certificate",
+        fields: [{ name: "FULL_NAME", x: 20, y: 30, size: 18 }],
+      })
+    ).data;
+    const job = (
+      await req("/generate", {
+        datasetId: dataset.id,
+        templateId: template.id,
+        mappings: { FULL_NAME: "Full Name" },
+        approved: true,
+        recordNumbers: [0, 2],
+      })
+    ).data;
+    assert.equal(job.total, 2);
+    for (let i = 0; i < 50; i++) {
+      const current = await state();
+      if (current.jobs.find((item) => item.id === job.id)?.status === "Completed") break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const current = await state();
+    const batch = current.jobs.find((item) => item.id === job.id);
+    assert.equal(batch.status, "Completed");
+    const files = current.generated.filter((item) => item.jobId === job.id);
+    assert.equal(files.length, 2);
+    assert.deepEqual(
+      files.map((item) => item.name).sort(),
+      ["Subset-Test-Certificate-1.pdf", "Subset-Test-Certificate-3.pdf"],
+    );
+  } finally {
+    const current = await state();
+    for (const x of Object.values(current).flat())
+      if (!before.has(x.id)) await req("/items/" + x.id, null, "DELETE");
+  }
+});
 test("document intelligence HTTP flow: OCR, exact evidence, review approval, correction, CSV and retry", async () => {
   const { mixedPDF } = await import("./fixtures.js");
   const { PDFParse } = await import("pdf-parse");

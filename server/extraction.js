@@ -134,6 +134,20 @@ export function validateAIFields(candidates, segments) {
   }
   return { fields, rejected };
 }
+function buildProviderUrl(base) {
+  const value = typeof base === "string" ? base.trim() : "";
+  if (!value) return "https://api.openai.com/v1/chat/completions";
+  try {
+    const url = new URL(value);
+    if (!["http:", "https:"].includes(url.protocol))
+      throw new Error("Invalid AI provider URL");
+    return url.toString().replace(/\/$/, "") + "/chat/completions";
+  } catch {
+    throw Object.assign(new Error("Invalid AI provider URL"), {
+      status: 503,
+    });
+  }
+}
 export async function extractWithAI(
   doc,
   {
@@ -155,8 +169,12 @@ export async function extractWithAI(
     throw new Error(
       "Document exceeds the AI extraction context limit. Split it into smaller files.",
     );
+  const providerUrl = buildProviderUrl(base);
+  const modelName = String(model || "").trim();
+  if (!modelName)
+    throw Object.assign(new Error("Invalid AI model"), { status: 503 });
   const response = await fetcher(
-    base.replace(/\/$/, "") + "/chat/completions",
+    providerUrl,
     {
       method: "POST",
       signal: AbortSignal.timeout(60000),
@@ -165,7 +183,7 @@ export async function extractWithAI(
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model,
+        model: modelName,
         temperature: 0,
         response_format: { type: "json_object" },
         messages: [
@@ -186,9 +204,28 @@ export async function extractWithAI(
       ),
       { status: 502 },
     );
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    throw Object.assign(
+      new Error(
+        "AI extraction returned invalid JSON; existing data was preserved.",
+      ),
+      { status: 502 },
+    );
+  }
+  const content = payload?.choices?.[0]?.message?.content;
+  if (typeof content !== "string")
+    throw Object.assign(
+      new Error(
+        "AI extraction returned invalid JSON; existing data was preserved.",
+      ),
+      { status: 502 },
+    );
   let result;
   try {
-    result = JSON.parse((await response.json()).choices[0].message.content);
+    result = JSON.parse(content);
   } catch {
     throw Object.assign(
       new Error(

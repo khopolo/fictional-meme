@@ -58,7 +58,9 @@ Not executed: live Supabase account registration/email verification and storage 
 Supabase URL and public anon key; server-only Supabase service key and both migrations; hosted validation of the implemented PostgreSQL/private storage adapter; server-only AI provider key and approved data-processing terms; durable queue and worker infrastructure; email delivery configuration; payment account and verified webhooks; malware scanning; rate limits/CSRF and upload resource controls; backup/retention policy; reviewed South African privacy and commercial terms. Existing UI privacy text is a development notice, not a completed legal policy.
 
 ## Run locally
-Node 24, npm install, npm run dev. Open port 3000. npm test starts an isolated temporary server/database and removes its fixture data. npm run build creates dist. Configure .env from .env.example and launch with node --env-file=.env server/index.js when integrations are available. Never place provider secrets in VITE-prefixed variables.
+Use Node 24 and run `npm install`. To enable individual user accounts, create a Supabase project, apply `supabase/schema.sql` followed by `supabase/002_runtime.sql` in its SQL editor, then configure Supabase email authentication and the allowed site/redirect URLs. Copy `.env.example` to `.env` and set `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and `SUPABASE_SERVICE_ROLE_KEY`; keep the service-role key server-only. `npm run dev` loads `.env` automatically and opens port 3000. With Supabase configured, users can register, sign in, reset passwords, and access owner-isolated data. Supabase Auth manages password hashes; the app never stores plaintext passwords. Without Supabase configuration, development continues in shared local-workspace mode without login.
+
+`npm test` starts an isolated temporary server/database and removes its fixture data. `npm run build` creates `dist`. Never place provider secrets in VITE-prefixed variables.
 
 ## Continuation verification and behavior changes — 2026-11-06
 

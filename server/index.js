@@ -34,6 +34,15 @@ const enqueueProcessing = createProcessingQueue(2);
 const extractionLocks = new Set();
 const root = path.resolve(process.env.DATA_DIR || ".data");
 fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+function validateHttpUrl(value, name) {
+  if (!value) return;
+  try {
+    const url = new URL(value);
+    if (!["http:", "https:"].includes(url.protocol)) throw new Error();
+  } catch {
+    throw new Error(`Invalid ${name}`);
+  }
+}
 function validateDeploymentConfig() {
   const checks = [
     ["SUPABASE_URL", process.env.SUPABASE_URL, true],
@@ -46,12 +55,7 @@ function validateDeploymentConfig() {
       throw new Error(`Missing ${name}`);
     }
     if (name === "SUPABASE_URL" || name === "AI_BASE_URL") {
-      try {
-        const url = new URL(value);
-        if (!["http:", "https:"].includes(url.protocol)) throw new Error();
-      } catch {
-        throw new Error(`Invalid ${name}`);
-      }
+      validateHttpUrl(value, name);
     }
     if (name === "AI_MODEL" && !String(value).trim())
       throw new Error("Invalid AI_MODEL");
@@ -147,7 +151,7 @@ const subscriptionPlans = [
   },
 ];
 const apiRateLimiter = (req, res, next) => {
-  if (req.path === "/health") return next();
+  if (req.path === "/health" || req.path === "/state") return next();
   const forwarded = req.headers["x-forwarded-for"];
   const ip = forwarded
     ? String(forwarded).split(",")[0].trim()
@@ -179,6 +183,33 @@ function logEvent(level, event, meta = {}) {
   };
   if (level === "error") console.error(JSON.stringify(entry));
   else console.log(JSON.stringify(entry));
+}
+function normaliseSignatureSettings(values = {}) {
+  const next = { ...values };
+  if (next.default !== undefined) next.default = Boolean(next.default);
+  if (next.opacity !== undefined) {
+    const opacity = Number(next.opacity);
+    next.opacity = Number.isFinite(opacity) ? Math.min(Math.max(opacity, 0), 1) : 0.9;
+  }
+  if (next.rotation !== undefined) {
+    const rotation = Number(next.rotation);
+    next.rotation = Number.isFinite(rotation) ? rotation : 0;
+  }
+  if (next.scale !== undefined) {
+    const scale = Number(next.scale);
+    next.scale = Number.isFinite(scale) && scale > 0 ? scale : 1;
+  }
+  if (next.width !== undefined) {
+    const width = Number(next.width);
+    next.width = Number.isFinite(width) && width > 0 ? width : 120;
+  }
+  if (next.height !== undefined) {
+    const height = Number(next.height);
+    next.height = Number.isFinite(height) && height > 0 ? height : 40;
+  }
+  if (next.printName !== undefined) next.printName = Boolean(next.printName);
+  if (next.printDate !== undefined) next.printDate = Boolean(next.printDate);
+  return next;
 }
 
 const app = express();
@@ -498,6 +529,7 @@ app.use("/api", async (q, s, next) => {
   next();
 });
 const list = (repo, kind) => repo.list(kind);
+const asArray = (value) => (Array.isArray(value) ? value : []);
 const get = (repo, id, kind) => repo.get(id, kind);
 const save = (repo, kind, data) => repo.save(kind, data);
 const audit = (repo, action, details) =>
@@ -534,56 +566,48 @@ const allowed = [
   "business",
   "tenders",
 ];
-app.get("/api/state", async (q, s) =>
-  s.json(
-    Object.fromEntries(
-      await Promise.all(
-        [
-          "documents",
-          "projects",
-          "templates",
-          "datasets",
-          "signatures",
-          "jobs",
-          "generated",
-          "business",
-          "tenders",
-          "comparisons",
-          "audit",
-        ].map(async (k) => [
-          k,
-          await Promise.all(
-            (await list(q.repo, k)).map(
-              async ({ filePath, storagePath, bucket, _kind, ...r }) =>
-                k === "signatures"
-                  ? {
-                      ...r,
-                      image:
-                        r.image ||
-                        "data:image/png;base64," +
-                          (
-                            await q.repo.readFile({
-                              filePath,
-                              storagePath,
-                              bucket,
-                            })
-                          ).toString("base64"),
-                    }
-                  : r,
+app.get("/api/state", async (q, s) => {
+  const kinds = [
+    "documents",
+    "projects",
+    "templates",
+    "datasets",
+    "signatures",
+    "jobs",
+    "generated",
+    "business",
+    "tenders",
+    "comparisons",
+    "audit",
+  ];
+  const state = {};
+  for (const kind of kinds) {
+    const raw = await list(q.repo, kind).catch(() => []);
+    state[kind] = await Promise.all(
+      asArray(raw).map(async ({ filePath, storagePath, bucket, _kind, ...r }) => {
+        if (kind !== "signatures") return r;
+        if (r.image) return { ...r, image: r.image };
+        if (!filePath && !storagePath) return { ...r, image: null };
+        return {
+          ...r,
+          image:
+            "data:image/png;base64," +
+            (await q.repo.readFile({ filePath, storagePath, bucket })).toString(
+              "base64",
             ),
-          ),
-        ]),
-      ),
-    ),
-  ),
-);
+        };
+      }),
+    );
+  }
+  s.json(state);
+});
 app.post("/api/items/:kind", async (q, s) => {
   if (!allowed.includes(q.params.kind)) return s.sendStatus(400);
   const fields = {
     projects: ["name", "description"],
     templates: ["name", "documentId", "fields"],
     datasets: ["name", "documentId", "records"],
-    signatures: ["name", "image"],
+    signatures: ["name", "image", "default", "opacity", "rotation", "scale", "width", "height", "printName", "printDate"],
     business: [
       "Registered company name",
       "Registration number",
@@ -600,11 +624,17 @@ app.post("/api/items/:kind", async (q, s) => {
   };
   let existing = {};
   if (q.body.id) existing = await get(q.repo, q.body.id, q.params.kind);
-  const clean = Object.fromEntries(
-    fields[q.params.kind]
-      .filter((k) => q.body[k] !== undefined)
-      .map((k) => [k, q.body[k]]),
+  const clean = normaliseSignatureSettings(
+    Object.fromEntries(
+      fields[q.params.kind]
+        .filter((k) => q.body[k] !== undefined)
+        .map((k) => [k, q.body[k]]),
+    ),
   );
+  if (q.params.kind === "signatures") {
+    clean.printName = clean.printName ?? true;
+    clean.printDate = clean.printDate ?? false;
+  }
   if (q.params.kind === "datasets") {
     if (
       existing.documentId &&
@@ -655,6 +685,13 @@ app.post("/api/items/:kind", async (q, s) => {
         !/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(clean.image)))
   )
     throw new Error("Signature must be a PNG image");
+  if (q.params.kind === "signatures" && clean.default === true) {
+    const defaults = (await list(q.repo, "signatures")).filter(
+      (item) => item.id !== existing.id && item.default,
+    );
+    for (const item of defaults)
+      await save(q.repo, "signatures", { ...item, default: false });
+  }
   let storedFile;
   if (q.params.kind === "signatures" && clean.image) {
     const bytes = Buffer.from(clean.image.split(",")[1], "base64");
@@ -952,6 +989,41 @@ app.post("/api/mappings", async (q, s) => {
     ),
   );
 });
+function normaliseRecordSelection(datasetRecords = [], recordNumbers, failedOnly = false, errors = []) {
+  const maxIndex = datasetRecords.length - 1;
+  const resolved = [];
+  if (Array.isArray(recordNumbers)) {
+    for (const value of recordNumbers) {
+      const index = Number(value);
+      if (!Number.isInteger(index) || index < 0 || index > maxIndex) continue;
+      resolved.push(index);
+    }
+  } else if (Number.isInteger(Number(recordNumbers)) && Number(recordNumbers) >= 0) {
+    resolved.push(Number(recordNumbers));
+  }
+  if (failedOnly) {
+    const failedRecords = new Set(
+      (errors || [])
+        .map((entry) => Number(entry.record))
+        .filter((value) => Number.isInteger(value) && value > 0)
+        .map((value) => value - 1),
+    );
+    for (const index of failedRecords) {
+      if (index <= maxIndex) resolved.push(index);
+    }
+  }
+  const unique = [...new Set(resolved)].sort((a, b) => a - b);
+  return unique.length ? unique : datasetRecords.map((_, index) => index);
+}
+function fileNameForRecord(templateName, recordIndex) {
+  const safeName = String(templateName || "Document")
+    .replace(/[^a-z0-9 -]/gi, "")
+    .trim()
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "") || "document";
+  return `${safeName}-${recordIndex + 1}.pdf`;
+}
 app.post("/api/preview", async (q, s) => {
   const template = await get(q.repo, q.body.templateId, "templates"),
     dataset = await get(q.repo, q.body.datasetId, "datasets");
@@ -968,11 +1040,21 @@ app.post("/api/preview", async (q, s) => {
     source ? await q.repo.readFile(source) : null,
     dataset.records[0] || {},
     q.body.mappings,
-    signature ? await signatureBytes(q.repo, signature) : null,
+    signature
+      ? {
+          bytes: await signatureBytes(q.repo, signature),
+          opacity: signature.opacity,
+          rotation: signature.rotation,
+          scale: signature.scale,
+          width: signature.width,
+          height: signature.height,
+        }
+      : null,
   );
   s.type("pdf").send(Buffer.from(bytes));
 });
-async function runGenerationBatch({ repo, job, template, dataset, mappings, sourceBytes, signingBytes, owner }) {
+async function runGenerationBatch({ repo, job, template, dataset, mappings, sourceBytes, signingAsset, owner, recordNumbers, failedOnly }) {
+  const selectedIndexes = normaliseRecordSelection(dataset.records || [], recordNumbers, failedOnly, job.errors || []);
   const existing = (await list(repo, "generated")).filter((d) => d.jobId === job.id);
   for (const item of existing) {
     await repo.deleteFile(item).catch(() => {});
@@ -982,27 +1064,28 @@ async function runGenerationBatch({ repo, job, template, dataset, mappings, sour
   job.failed = 0;
   job.errors = [];
   job.status = "Processing";
+  job.total = selectedIndexes.length || dataset.records.length || 0;
   job.updatedAt = new Date().toISOString();
   await save(repo, "jobs", job);
-  for (let i = 0; i < dataset.records.length; i++) {
+  for (const recordIndex of selectedIndexes) {
     let file;
     try {
       const bytes = await generatePDF(
         template,
         sourceBytes,
-        dataset.records[i],
+        dataset.records[recordIndex],
         mappings,
-        signingBytes,
+        signingAsset,
       );
       const id = crypto.randomUUID();
       file = await repo.putFile(bytes);
       await save(repo, "generated", {
         id,
         jobId: job.id,
-        name: `${template.name.replace(/[^a-z0-9 -]/gi, "")}-${i + 1}.pdf`,
+        name: fileNameForRecord(template.name, recordIndex),
         size: bytes.length,
         ...file,
-        record: i + 1,
+        record: recordIndex + 1,
       });
       job.completed++;
     } catch (e) {
@@ -1011,7 +1094,7 @@ async function runGenerationBatch({ repo, job, template, dataset, mappings, sour
           .deleteFile(file)
           .catch(() => console.error("Generated file cleanup requires retry"));
       job.failed++;
-      job.errors.push({ record: i + 1, error: e.message });
+      job.errors.push({ record: recordIndex + 1, error: e.message });
     }
     job.updatedAt = new Date().toISOString();
     await save(repo, "jobs", job);
@@ -1025,6 +1108,7 @@ async function runGenerationBatch({ repo, job, template, dataset, mappings, sour
 app.post("/api/generate", async (q, s) => {
   await requireEntitlement(q.repo, "generation", "Document generation");
   const { templateId, datasetId, mappings, signatureId, authorised } = q.body;
+  const requestedRecords = q.body.recordNumbers ?? q.body.records ?? q.body.selectedRecords ?? q.body.recordIndexes;
   const template = await get(q.repo, templateId, "templates"),
     dataset = await get(q.repo, datasetId, "datasets");
   if (q.body.approved !== true) throw new Error("Mapping approval required");
@@ -1035,6 +1119,11 @@ app.post("/api/generate", async (q, s) => {
     return s
       .status(400)
       .json({ error: "Explicit signing authorisation required" });
+  const selectedIndexes = normaliseRecordSelection(
+    dataset.records || [],
+    requestedRecords,
+  );
+  const totalRecords = selectedIndexes.length || dataset.records.length || 0;
   const signature = signatureId
     ? await get(q.repo, signatureId, "signatures")
     : null;
@@ -1042,8 +1131,15 @@ app.post("/api/generate", async (q, s) => {
     ? await get(q.repo, template.documentId, "documents")
     : null;
   const sourceBytes = source ? await q.repo.readFile(source) : null;
-  const signingBytes = signature
-    ? await signatureBytes(q.repo, signature)
+  const signingAsset = signature
+    ? {
+        bytes: await signatureBytes(q.repo, signature),
+        opacity: signature.opacity,
+        rotation: signature.rotation,
+        scale: signature.scale,
+        width: signature.width,
+        height: signature.height,
+      }
     : null;
   const job = await save(q.repo, "jobs", {
     name: template.name,
@@ -1051,7 +1147,7 @@ app.post("/api/generate", async (q, s) => {
     datasetId,
     signatureId: signatureId || null,
     status: "Processing",
-    total: dataset.records.length,
+    total: totalRecords,
     completed: 0,
     failed: 0,
     errors: [],
@@ -1080,8 +1176,9 @@ app.post("/api/generate", async (q, s) => {
       dataset,
       mappings,
       sourceBytes,
-      signingBytes,
+      signingAsset,
       owner: q.owner,
+      recordNumbers: selectedIndexes,
     }).catch(() =>
       console.error("Generation worker could not persist its result"),
     ),
@@ -1100,10 +1197,19 @@ app.post("/api/jobs/:id/retry", async (q, s) => {
     ? await get(q.repo, template.documentId, "documents")
     : null;
   const sourceBytes = source ? await q.repo.readFile(source) : null;
-  const signingBytes = signature
-    ? await signatureBytes(q.repo, signature)
+  const signingAsset = signature
+    ? {
+        bytes: await signatureBytes(q.repo, signature),
+        opacity: signature.opacity,
+        rotation: signature.rotation,
+        scale: signature.scale,
+        width: signature.width,
+        height: signature.height,
+      }
     : null;
   const mappings = job.mappings || {};
+  const requestedRecords = q.body?.recordNumbers ?? q.body?.records ?? q.body?.selectedRecords ?? q.body?.recordIndexes;
+  const failedOnly = Boolean(q.body?.failedOnly || q.body?.retryFailed);
   s.json(
     await runGenerationBatch({
       repo: q.repo,
@@ -1112,8 +1218,10 @@ app.post("/api/jobs/:id/retry", async (q, s) => {
       dataset,
       mappings,
       sourceBytes,
-      signingBytes,
+      signingAsset,
       owner: q.owner,
+      recordNumbers: requestedRecords,
+      failedOnly,
     }),
   );
 });
@@ -1156,14 +1264,16 @@ app.post("/api/assistant", async (q, s) => {
       error:
         "AI provider is not configured. Add AI_API_KEY and optionally AI_BASE_URL and AI_MODEL on the server. Document parsing and generation remain available.",
     });
+  const baseUrl = process.env.AI_BASE_URL || "https://api.openai.com/v1";
+  validateHttpUrl(baseUrl, "AI_BASE_URL");
+  const model = String(process.env.AI_MODEL || "gpt-4.1-mini").trim();
+  if (!model) throw new Error("Invalid AI_MODEL");
   const docs = (await list(q.repo, "documents")).map((d) => ({
     id: d.id,
     name: d.name,
     text: d.text?.slice(0, 12000),
   }));
-  const r = await fetch(
-    (process.env.AI_BASE_URL || "https://api.openai.com/v1") +
-      "/chat/completions",
+  const r = await fetch(baseUrl.replace(/\/$/, "") + "/chat/completions",
     {
       method: "POST",
       headers: {
@@ -1171,7 +1281,7 @@ app.post("/api/assistant", async (q, s) => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: process.env.AI_MODEL || "gpt-4.1-mini",
+        model,
         messages: [
           {
             role: "system",

@@ -945,17 +945,44 @@ function App() {
                       <section className="panel signature-card" key={s.id}>
                         <img src={s.image} alt={s.name} />
                         <div className="card-content">
-                          <h3>{s.name}</h3>
+                          <div className="row-actions">
+                            <h3>{s.name}</h3>
+                            {s.default && <span className="badge success">Default</span>}
+                          </div>
                           <small>
                             Saved {new Date(s.createdAt).toLocaleDateString()}
                           </small>
-                          <button
-                            className="icon-btn"
-                            aria-label="Delete signature"
-                            onClick={() => remove(s)}
-                          >
-                            <Trash2 size={17} />
-                          </button>
+                          <div className="row-actions">
+                            {!s.default && (
+                              <button
+                                onClick={() => save("signatures", { ...s, default: true })}
+                              >
+                                Make default
+                              </button>
+                            )}
+                            <button
+                              onClick={() =>
+                                setModal({
+                                  title: "Edit signature",
+                                  content: (
+                                    <SignatureForm
+                                      initial={s}
+                                      onSave={(v) => save("signatures", { ...s, ...v })}
+                                    />
+                                  ),
+                                })
+                              }
+                            >
+                              Edit
+                            </button>
+                            <button
+                              className="icon-btn"
+                              aria-label="Delete signature"
+                              onClick={() => remove(s)}
+                            >
+                              <Trash2 size={17} />
+                            </button>
+                          </div>
                         </div>
                       </section>
                     ))}
@@ -2134,12 +2161,22 @@ function TemplateForm({ docs, initial, onSave }) {
     </form>
   );
 }
-function SignatureForm({ onSave }) {
+function SignatureForm({ onSave, initial }) {
   const canvas = useRef(),
     drawing = useRef(false);
-  const [name, setName] = useState("My signature");
+  const [name, setName] = useState(initial?.name || "My signature");
+  const [defaultSignature, setDefaultSignature] = useState(Boolean(initial?.default));
+  const [printName, setPrintName] = useState(initial?.printName !== false);
+  const [printDate, setPrintDate] = useState(Boolean(initial?.printDate));
+  const [opacity, setOpacity] = useState(Number(initial?.opacity) || 0.9);
+  const [rotation, setRotation] = useState(Number(initial?.rotation) || 0);
+  const [scale, setScale] = useState(Number(initial?.scale) || 1);
+  const [width, setWidth] = useState(Number(initial?.width) || 120);
+  const [height, setHeight] = useState(Number(initial?.height) || 40);
+  const [crop, setCrop] = useState({ x: 0, y: 0, width: 0, height: 0 });
+  const [source, setSource] = useState(initial?.image || "");
   const [error, setError] = useState("");
-  const touched = useRef(false);
+  const touched = useRef(Boolean(initial?.image));
   function point(e) {
     const c = canvas.current,
       r = c.getBoundingClientRect();
@@ -2148,6 +2185,31 @@ function SignatureForm({ onSave }) {
       ((e.clientY - r.top) * c.height) / r.height,
     ];
   }
+  useEffect(() => {
+    if (!canvas.current || !source) return;
+    const img = new window.Image();
+    img.onload = () => {
+      const ctx = canvas.current.getContext("2d");
+      ctx.clearRect(0, 0, 700, 220);
+      const cropX = Number(crop.x) || 0;
+      const cropY = Number(crop.y) || 0;
+      const cropWidth = Number(crop.width) > 0 ? Number(crop.width) : img.width;
+      const cropHeight = Number(crop.height) > 0 ? Number(crop.height) : img.height;
+      ctx.drawImage(
+        img,
+        cropX,
+        cropY,
+        cropWidth,
+        cropHeight,
+        0,
+        0,
+        700,
+        220,
+      );
+      touched.current = true;
+    };
+    img.src = source;
+  }, [source, crop]);
   return (
     <div className="form">
       <label>
@@ -2183,6 +2245,7 @@ function SignatureForm({ onSave }) {
         <button
           onClick={() => {
             canvas.current.getContext("2d").clearRect(0, 0, 700, 220);
+            setSource("");
             touched.current = false;
           }}
         >
@@ -2197,24 +2260,163 @@ function SignatureForm({ onSave }) {
             onChange={(e) => {
               const file = e.target.files[0];
               if (!file) return;
-              const img = new window.Image();
-              img.onload = () => {
-                canvas.current.getContext("2d").drawImage(img, 0, 0, 700, 220);
-                touched.current = true;
-                URL.revokeObjectURL(img.src);
+              const reader = new FileReader();
+              reader.onload = () => {
+                const dataUrl = String(reader.result || "");
+                const img = new window.Image();
+                img.onload = () => {
+                  const ctx = canvas.current.getContext("2d");
+                  ctx.clearRect(0, 0, 700, 220);
+                  ctx.drawImage(img, 0, 0, 700, 220);
+                  setCrop({ x: 0, y: 0, width: img.width, height: img.height });
+                  setSource(dataUrl);
+                  touched.current = true;
+                };
+                img.src = dataUrl;
               };
-              img.src = URL.createObjectURL(file);
+              reader.readAsDataURL(file);
             }}
           />
         </label>
       </div>
+      <div className="form-grid">
+        <label>
+          Crop left
+          <input
+            type="number"
+            min="0"
+            value={crop.x}
+            onChange={(e) => setCrop({ ...crop, x: Number(e.target.value) || 0 })}
+          />
+        </label>
+        <label>
+          Crop top
+          <input
+            type="number"
+            min="0"
+            value={crop.y}
+            onChange={(e) => setCrop({ ...crop, y: Number(e.target.value) || 0 })}
+          />
+        </label>
+        <label>
+          Crop width
+          <input
+            type="number"
+            min="1"
+            value={crop.width || ""}
+            onChange={(e) => setCrop({ ...crop, width: Number(e.target.value) || 0 })}
+          />
+        </label>
+        <label>
+          Crop height
+          <input
+            type="number"
+            min="1"
+            value={crop.height || ""}
+            onChange={(e) => setCrop({ ...crop, height: Number(e.target.value) || 0 })}
+          />
+        </label>
+      </div>
+      <div className="form-grid">
+        <label>
+          Width
+          <input
+            type="number"
+            min="40"
+            max="300"
+            step="10"
+            value={width}
+            onChange={(e) => setWidth(Number(e.target.value) || 120)}
+          />
+        </label>
+        <label>
+          Height
+          <input
+            type="number"
+            min="20"
+            max="200"
+            step="10"
+            value={height}
+            onChange={(e) => setHeight(Number(e.target.value) || 40)}
+          />
+        </label>
+        <label>
+          Opacity
+          <input
+            type="number"
+            min="0.1"
+            max="1"
+            step="0.05"
+            value={opacity}
+            onChange={(e) => setOpacity(Number(e.target.value) || 0.9)}
+          />
+        </label>
+        <label>
+          Rotation (°)
+          <input
+            type="number"
+            min="-180"
+            max="180"
+            step="5"
+            value={rotation}
+            onChange={(e) => setRotation(Number(e.target.value) || 0)}
+          />
+        </label>
+        <label>
+          Scale
+          <input
+            type="number"
+            min="0.5"
+            max="2"
+            step="0.1"
+            value={scale}
+            onChange={(e) => setScale(Number(e.target.value) || 1)}
+          />
+        </label>
+      </div>
+      <label className="checkbox">
+        <input
+          type="checkbox"
+          checked={printName}
+          onChange={(e) => setPrintName(e.target.checked)}
+        />
+        Print signature name on the document
+      </label>
+      <label className="checkbox">
+        <input
+          type="checkbox"
+          checked={printDate}
+          onChange={(e) => setPrintDate(e.target.checked)}
+        />
+        Print authorisation date on the document
+      </label>
+      <label className="checkbox">
+        <input
+          type="checkbox"
+          checked={defaultSignature}
+          onChange={(e) => setDefaultSignature(e.target.checked)}
+        />
+        Use as my default signature for new batches
+      </label>
       {error && <p className="error">{error}</p>}
       <button
         className="primary"
         onClick={() => {
           if (!touched.current || !name.trim())
             return setError("Add a signature and its name.");
-          onSave({ name, image: canvas.current.toDataURL("image/png") });
+          if (!canvas.current) return setError("Signature canvas is not ready.");
+          onSave({
+            name,
+            image: canvas.current.toDataURL("image/png"),
+            default: defaultSignature,
+            printName,
+            printDate,
+            opacity,
+            rotation,
+            scale,
+            width,
+            height,
+          });
         }}
       >
         Save signature
@@ -2242,6 +2444,11 @@ function Generator({ state, run, notify, go }) {
         .then(setM)
         .catch((e) => notify(e.message));
   }, [d, t]);
+  useEffect(() => {
+    if (sig || !(state.signatures || []).length) return;
+    const defaultSignature = (state.signatures || []).find((item) => item.default);
+    if (defaultSignature) setSig(defaultSignature.id);
+  }, [sig, state.signatures]);
   const cols = Object.keys(
     datasets.find((x) => x.id === d)?.records[0] || {},
   ).filter((c) => !c.startsWith("_"));

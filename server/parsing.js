@@ -64,8 +64,9 @@ async function recognise(worker, bytes, location) {
   };
 }
 export async function parseDocument(input, ext) {
+  const normalizedExt = String(ext || "").toLowerCase();
   const bytes = typeof input === "string" ? await fs.readFile(input) : input;
-  if (["xlsx", "xls", "csv"].includes(ext)) {
+  if (["xlsx", "xls", "csv"].includes(normalizedExt)) {
     const book = XLSX.read(bytes, { type: "buffer", cellDates: true });
     const records = book.SheetNames.flatMap((sheet) =>
       XLSX.utils
@@ -97,7 +98,7 @@ export async function parseDocument(input, ext) {
       processing: { method: "spreadsheet", ocrPages: 0 },
     };
   }
-  if (ext === "pdf") {
+  if (normalizedExt === "pdf") {
     const pdf = await PDFDocument.load(bytes);
     const pages = pdf.getPages();
     if (pages.length > limit("MAX_PDF_PAGES", 100, 500))
@@ -171,7 +172,7 @@ export async function parseDocument(input, ext) {
       await parser.destroy();
     }
   }
-  if (["png", "jpg", "jpeg"].includes(ext)) {
+  if (["png", "jpg", "jpeg"].includes(normalizedExt)) {
     const result = await withOCR((worker) =>
       recognise(worker, bytes, { page: 1 }),
     );
@@ -184,7 +185,7 @@ export async function parseDocument(input, ext) {
     };
   }
   const text =
-    ext === "docx"
+    normalizedExt === "docx"
       ? (await mammoth.extractRawText({ buffer: bytes })).value
       : bytes.toString("utf8");
   if (text.length > 2000000)
@@ -193,9 +194,9 @@ export async function parseDocument(input, ext) {
     text,
     records: [],
     segments: textSegments(text, {
-      method: ext === "docx" ? "word-text" : "text",
+      method: normalizedExt === "docx" ? "word-text" : "text",
       confidence: null,
     }),
-    processing: { method: ext === "docx" ? "word-text" : "text", ocrPages: 0 },
+    processing: { method: normalizedExt === "docx" ? "word-text" : "text", ocrPages: 0 },
   };
 }
